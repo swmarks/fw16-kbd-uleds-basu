@@ -237,9 +237,9 @@ static void update_sysfs_brightness(const char *name, unsigned val) {
     }
 }
 
-static void sync_ui(unsigned val, unsigned pct) {
+static void sync_ui(unsigned val) {
     // Synchronize UI via PowerDevil on the true Session Bus
-    dbg(1, "syncing UI to absolute value %u, percentage %u%% (via PowerDevil)\n", val, pct);
+    dbg(1, "syncing UI to absolute value %u (via PowerDevil)\n", val);
 
     DIR *d = opendir("/run/user");
     if (d) {
@@ -254,6 +254,11 @@ static void sync_ui(unsigned val, unsigned pct) {
                 if (pw && setresuid(uid, uid, uid) == 0) {
                     setenv("HOME", pw->pw_dir, 1);
                     setenv("USER", pw->pw_name, 1);
+
+                    // CRITICAL FIX: Sleep for 100ms.
+                    // This allows the parent daemon to drain the uleds event queue from the sysfs write
+                    // so that when PowerDevil tries to tell UPower to update, the kernel buffer isn't full.
+                    usleep(100000);
 
                     // The Catch-All Scraper: Find the TRUE Artix D-Bus Address
                     DIR *pdir = opendir("/proc");
@@ -318,17 +323,17 @@ static void sync_ui(unsigned val, unsigned pct) {
                     if (sd_bus_open_user(&sbus) >= 0) {
                         sd_bus_error error = SD_BUS_ERROR_NULL;
 
-                        // Tell PowerDevil directly so it updates the slider AND the OSD natively
-                        // PASSING PCT (PERCENTAGE) INSTEAD OF VAL
+                        // Tell PowerDevil directly so it updates the slider AND the OSD natively.
+                        // Plasma 6 expects the absolute value (0-3), NOT a percentage!
                         int r = sd_bus_call_method(sbus, "org.kde.Solid.PowerManagement",
                                                    "/org/kde/Solid/PowerManagement/Actions/KeyboardBrightnessControl",
                                                    "org.kde.Solid.PowerManagement.Actions.KeyboardBrightnessControl",
-                                                   "setKeyboardBrightness", &error, NULL, "i", (int32_t)pct);
+                                                   "setKeyboardBrightness", &error, NULL, "i", (int32_t)val);
 
                         if (r < 0 && g_debug_level >= 3) {
                             dbg(3, "    PowerDevil call failed: %s\n", error.message);
                         } else if (r >= 0 && g_debug_level >= 3) {
-                            dbg(3, "    PowerDevil perfectly synced with %u%%!\n", pct);
+                            dbg(3, "    PowerDevil perfectly synced with absolute value %u!\n", val);
                         }
 
                         sd_bus_error_free(&error);
@@ -721,13 +726,12 @@ int main(int argc, char **argv) {
 
             // Immediately sync sysfs and other modules if needed
             unsigned sysfs_val = (level * max_brightness) / 3;
-            unsigned pct_val = (level * 100) / 3;
             update_sysfs_brightness(ctxs[i].name, sysfs_val);
             if (ctxs[i].targets_len > 1) {
                 qmk_apply_all(ctxs[i].targets, ctxs[i].targets_len, level, NULL);
             }
             // Sync UI state natively
-            sync_ui(sysfs_val, pct_val);
+            sync_ui(sysfs_val);
         }
     }
 
@@ -799,9 +803,8 @@ int main(int argc, char **argv) {
                             qmk_apply_all(ctxs[i].targets, ctxs[i].targets_len, level, &ctxs[i].master);
 
                             unsigned sysfs_val = (level * max_brightness) / 3;
-                            unsigned pct_val = (level * 100) / 3;
                             update_sysfs_brightness(ctxs[i].name, sysfs_val);
-                            sync_ui(sysfs_val, pct_val);
+                            sync_ui(sysfs_val);
                         }
                     }
                 }
