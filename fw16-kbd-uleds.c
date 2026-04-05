@@ -64,6 +64,7 @@
 /* -------------------- Debug -------------------- */
 
 static int g_debug_level = 0;
+static pid_t g_sync_pid = -1;
 
 static void dbg(int lvl, const char *fmt, ...) {
     if (g_debug_level < lvl) return;
@@ -237,114 +238,116 @@ static void update_sysfs_brightness(const char *name, unsigned val) {
     }
 }
 
-static void sync_ui(unsigned val) {
+static void sync_ui(unsigned val, unsigned pct) {
     // Synchronize UI via PowerDevil on the true Session Bus
-    dbg(1, "syncing UI to absolute value %u (via PowerDevil)\n", val);
+    dbg(1, "syncing UI to absolute value %u, percentage %u%% (via PowerDevil)\n", val, pct);
 
-    DIR *d = opendir("/run/user");
-    if (d) {
-        struct dirent *de;
-        while ((de = readdir(d))) {
-            if (de->d_name[0] == '.') continue;
-            uid_t uid = (uid_t)atoi(de->d_name);
-            if (uid == 0) continue;
+    // RACE CONDITION FIX: If the user rapid-fires the brightness keys,
+    // kill the older, sleeping D-Bus sync process before spawning a new one.
+    // This guarantees KDE always receives the absolute latest state in the correct order.
+    if (g_sync_pid > 0) {
+        kill(g_sync_pid, SIGKILL);
+    }
 
-            if (fork() == 0) {
-                struct passwd *pw = getpwuid(uid);
-                if (pw && setresuid(uid, uid, uid) == 0) {
-                    setenv("HOME", pw->pw_dir, 1);
-                    setenv("USER", pw->pw_name, 1);
+    g_sync_pid = fork();
+    if (g_sync_pid == 0) {
+        // CRITICAL FIX: Sleep for 100ms.
+        // This allows the parent daemon to drain the uleds event queue from the sysfs write
+        // so that when PowerDevil tries to tell UPower to update, the kernel buffer isn't full.
+        usleep(100000);
 
-                    // CRITICAL FIX: Sleep for 100ms.
-                    // This allows the parent daemon to drain the uleds event queue from the sysfs write
-                    // so that when PowerDevil tries to tell UPower to update, the kernel buffer isn't full.
-                    usleep(100000);
+        DIR *d = opendir("/run/user");
+        if (d) {
+            struct dirent *de;
+            while ((de = readdir(d))) {
+                if (de->d_name[0] == '.') continue;
+                uid_t uid = (uid_t)atoi(de->d_name);
+                if (uid == 0) continue;
 
-                    // The Catch-All Scraper: Find the TRUE Artix D-Bus Address
-                    DIR *pdir = opendir("/proc");
-                    if (pdir) {
-                        struct dirent *pent;
-                        while ((pent = readdir(pdir))) {
-                            if (pent->d_name[0] < '0' || pent->d_name[0] > '9') continue;
+                if (fork() == 0) {
+                    struct passwd *pw = getpwuid(uid);
+                    if (pw && setresuid(uid, uid, uid) == 0) {
+                        setenv("HOME", pw->pw_dir, 1);
+                        setenv("USER", pw->pw_name, 1);
 
-                            char ppath[512];
-                            snprintf(ppath, sizeof(ppath), "/proc/%s/status", pent->d_name);
-                            FILE *f = fopen(ppath, "r");
-                            if (!f) continue;
+                        // The Catch-All Scraper: Find the TRUE Artix D-Bus Address
+                        DIR *pdir = opendir("/proc");
+                        if (pdir) {
+                            struct dirent *pent;
+                            while ((pent = readdir(pdir))) {
+                                if (pent->d_name[0] < '0' || pent->d_name[0] > '9') continue;
 
-                            char line[256];
-                            int is_uid = 0;
-                            while (fgets(line, sizeof(line), f)) {
-                                if (strncmp(line, "Uid:", 4) == 0) {
-                                    uid_t f_uid;
-                                    if (sscanf(line + 4, "%u", &f_uid) == 1 && f_uid == uid) is_uid = 1;
-                                    break;
-                                }
-                            }
-                            fclose(f);
+                                char ppath[512];
+                                snprintf(ppath, sizeof(ppath), "/proc/%s/status", pent->d_name);
+                                FILE *f = fopen(ppath, "r");
+                                if (!f) continue;
 
-                            if (is_uid) {
-                                snprintf(ppath, sizeof(ppath), "/proc/%s/environ", pent->d_name);
-                                f = fopen(ppath, "r");
-                                if (f) {
-                                    char *env_line = NULL;
-                                    size_t env_len = 0;
-                                    int has_display = 0;
-                                    char *bus_addr = NULL;
-
-                                    while (getdelim(&env_line, &env_len, '\0', f) != -1) {
-                                        if (strncmp(env_line, "DISPLAY=", 8) == 0 || strncmp(env_line, "WAYLAND_DISPLAY=", 16) == 0) {
-                                            has_display = 1;
-                                        } else if (strncmp(env_line, "DBUS_SESSION_BUS_ADDRESS=", 25) == 0) {
-                                            bus_addr = strdup(env_line + 25);
-                                        }
-                                    }
-
-                                    // If graphical app on a non-default bus, grab the address!
-                                    if (has_display && bus_addr && strstr(bus_addr, "/run/user/") == NULL) {
-                                        setenv("DBUS_SESSION_BUS_ADDRESS", bus_addr, 1);
-                                        if (g_debug_level >= 3)
-                                            dbg(3, "    Found true dbus address from PID %s: %s\n", pent->d_name, bus_addr);
-                                        free(bus_addr);
-                                        free(env_line);
-                                        fclose(f);
+                                char line[256];
+                                int is_uid = 0;
+                                while (fgets(line, sizeof(line), f)) {
+                                    if (strncmp(line, "Uid:", 4) == 0) {
+                                        uid_t f_uid;
+                                        if (sscanf(line + 4, "%u", &f_uid) == 1 && f_uid == uid) is_uid = 1;
                                         break;
                                     }
-                                    if (bus_addr) free(bus_addr);
-                                    free(env_line);
-                                    fclose(f);
+                                }
+                                fclose(f);
+
+                                if (is_uid) {
+                                    snprintf(ppath, sizeof(ppath), "/proc/%s/environ", pent->d_name);
+                                    f = fopen(ppath, "r");
+                                    if (f) {
+                                        char *env_line = NULL;
+                                        size_t env_len = 0;
+                                        int has_display = 0;
+                                        char *bus_addr = NULL;
+
+                                        while (getdelim(&env_line, &env_len, '\0', f) != -1) {
+                                            if (strncmp(env_line, "DISPLAY=", 8) == 0 || strncmp(env_line, "WAYLAND_DISPLAY=", 16) == 0) {
+                                                has_display = 1;
+                                            } else if (strncmp(env_line, "DBUS_SESSION_BUS_ADDRESS=", 25) == 0) {
+                                                bus_addr = strdup(env_line + 25);
+                                            }
+                                        }
+
+                                        if (has_display && bus_addr && strstr(bus_addr, "/run/user/") == NULL) {
+                                            setenv("DBUS_SESSION_BUS_ADDRESS", bus_addr, 1);
+                                            free(bus_addr);
+                                            free(env_line);
+                                            fclose(f);
+                                            break;
+                                        }
+                                        if (bus_addr) free(bus_addr);
+                                        free(env_line);
+                                        fclose(f);
+                                    }
                                 }
                             }
-                        }
-                        closedir(pdir);
-                    }
-
-                    sd_bus *sbus = NULL;
-                    if (sd_bus_open_user(&sbus) >= 0) {
-                        sd_bus_error error = SD_BUS_ERROR_NULL;
-
-                        // Tell PowerDevil directly so it updates the slider AND the OSD natively.
-                        // Plasma 6 expects the absolute value (0-3), NOT a percentage!
-                        int r = sd_bus_call_method(sbus, "org.kde.Solid.PowerManagement",
-                                                   "/org/kde/Solid/PowerManagement/Actions/KeyboardBrightnessControl",
-                                                   "org.kde.Solid.PowerManagement.Actions.KeyboardBrightnessControl",
-                                                   "setKeyboardBrightness", &error, NULL, "i", (int32_t)val);
-
-                        if (r < 0 && g_debug_level >= 3) {
-                            dbg(3, "    PowerDevil call failed: %s\n", error.message);
-                        } else if (r >= 0 && g_debug_level >= 3) {
-                            dbg(3, "    PowerDevil perfectly synced with absolute value %u!\n", val);
+                            closedir(pdir);
                         }
 
-                        sd_bus_error_free(&error);
-                        sd_bus_flush(sbus);
-                        sd_bus_unref(sbus);
+                        sd_bus *sbus = NULL;
+                        if (sd_bus_open_user(&sbus) >= 0) {
+                            sd_bus_error error = SD_BUS_ERROR_NULL;
+
+                            sd_bus_call_method(sbus, "org.kde.Solid.PowerManagement",
+                                               "/org/kde/Solid/PowerManagement/Actions/KeyboardBrightnessControl",
+                                               "org.kde.Solid.PowerManagement.Actions.KeyboardBrightnessControl",
+                                               "setKeyboardBrightness", &error, NULL, "i", (int32_t)val);
+
+                            sd_bus_error_free(&error);
+                            sd_bus_flush(sbus);
+                            sd_bus_unref(sbus);
+                        }
                     }
+                    exit(0);
                 }
-                exit(0);
             }
+            closedir(d);
         }
-        closedir(d);
+        // Wait for all user-specific forks to finish before this master fork exits
+        while(wait(NULL) > 0);
+        exit(0);
     }
 }
 
@@ -541,7 +544,7 @@ int main(int argc, char **argv) {
     target_t manual_targets[16];
     size_t num_manual_targets = 0;
     unsigned max_brightness = 3;
-    unsigned poll_ms = 1000;
+    unsigned poll_ms = 100;
 
     // Default VID
     vids[num_vids++] = 0x32ac;
@@ -726,12 +729,14 @@ int main(int argc, char **argv) {
 
             // Immediately sync sysfs and other modules if needed
             unsigned sysfs_val = (level * max_brightness) / 3;
+            unsigned pct_val = level_to_qmk_pct(level);
+
             update_sysfs_brightness(ctxs[i].name, sysfs_val);
             if (ctxs[i].targets_len > 1) {
                 qmk_apply_all(ctxs[i].targets, ctxs[i].targets_len, level, NULL);
             }
             // Sync UI state natively
-            sync_ui(sysfs_val);
+            sync_ui(sysfs_val, pct_val);
         }
     }
 
@@ -803,8 +808,10 @@ int main(int argc, char **argv) {
                             qmk_apply_all(ctxs[i].targets, ctxs[i].targets_len, level, &ctxs[i].master);
 
                             unsigned sysfs_val = (level * max_brightness) / 3;
+                            unsigned pct_val = level_to_qmk_pct(level);
+
                             update_sysfs_brightness(ctxs[i].name, sysfs_val);
-                            sync_ui(sysfs_val);
+                            sync_ui(sysfs_val, pct_val);
                         }
                     }
                 }
