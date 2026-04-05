@@ -240,9 +240,9 @@ static void update_sysfs_brightness(const char *name, unsigned val) {
     }
 }
 
-static void sync_ui(unsigned level) {
+static void sync_ui(unsigned val) {
     // Synchronize UI via UPower (system bus) and KDE PowerDevil (session bus).
-    dbg(1, "syncing UI to level %u (sd-bus)\n", level);
+    dbg(1, "syncing UI to absolute value %u (sd-bus)\n", val);
 
     // 1. System Bus (UPower)
     if (fork() == 0) {
@@ -258,7 +258,7 @@ static void sync_ui(unsigned level) {
                     for (char **p = paths; *p; p++) {
                         if (g_debug_level >= 3) dbg(3, "  UPower sync: %s\n", *p);
                         sd_bus_call_method(bus, "org.freedesktop.UPower", *p,
-                                           "org.freedesktop.UPower.KbdBacklight", "SetBrightness", NULL, NULL, "i", (int32_t)level);
+                                           "org.freedesktop.UPower.KbdBacklight", "SetBrightness", NULL, NULL, "i", (int32_t)val);
                     }
                 }
                 sd_bus_message_unref(m);
@@ -289,6 +289,12 @@ static void sync_ui(unsigned level) {
                 if (pw && setresuid(uid, uid, uid) == 0) {
                     setenv("HOME", pw->pw_dir, 1);
                     setenv("USER", pw->pw_name, 1);
+
+                    // FIX: sd-bus / basu requires XDG_RUNTIME_DIR to connect to the session bus!
+                    char run_dir[256];
+                    snprintf(run_dir, sizeof(run_dir), "/run/user/%u", uid);
+                    setenv("XDG_RUNTIME_DIR", run_dir, 1);
+
                     char address[528];
                     snprintf(address, sizeof(address), "unix:path=%s", socket_path);
                     setenv("DBUS_SESSION_BUS_ADDRESS", address, 1);
@@ -301,7 +307,7 @@ static void sync_ui(unsigned level) {
                         r = sd_bus_call_method(sbus, "org.kde.org_kde_powerdevil",
                                                "/org/kde/Solid/PowerManagement/Actions/KeyboardBrightnessControl",
                                                "org.kde.Solid.PowerManagement.Actions.KeyboardBrightnessControl",
-                                               "setKeyboardBrightness", &error, NULL, "i", (int32_t)level);
+                                               "setKeyboardBrightness", &error, NULL, "i", (int32_t)val);
                         if (r < 0 && g_debug_level >= 3)
                             dbg(3, "    PowerDevil call failed for user %u: %s\n", uid, error.message);
                         sd_bus_error_free(&error);
@@ -705,7 +711,7 @@ int main(int argc, char **argv) {
                 qmk_apply_all(ctxs[i].targets, ctxs[i].targets_len, level, NULL);
             }
             // Sync UPower state to match initial hardware level
-            sync_ui(level);
+            sync_ui(sysfs_val);
         }
     }
 
@@ -769,14 +775,16 @@ int main(int argc, char **argv) {
                     if (pct >= 0) {
                         unsigned level = pct_to_level((unsigned)pct);
                         if (level != ctxs[i].last_level) {
-                            dbg(1, "hardware change detected on [%s] (via %04x:%04x): %u -> %u\n", 
+                            dbg(1, "hardware change detected on [%s] (via %04x:%04x): %u -> %u\n",
                                 ctxs[i].name, ctxs[i].master.vid, ctxs[i].master.pid, ctxs[i].last_level, level);
                             ctxs[i].last_level = level;
+
                             // Apply to all OTHER targets in this context to keep them in sync
-                            // We skip the master because it already changed at the hardware level
                             qmk_apply_all(ctxs[i].targets, ctxs[i].targets_len, level, &ctxs[i].master);
-                            update_sysfs_brightness(ctxs[i].name, (level * max_brightness) / 3);
-                            sync_ui(level);
+
+                            unsigned sysfs_val = (level * max_brightness) / 3;
+                            update_sysfs_brightness(ctxs[i].name, sysfs_val);
+                            sync_ui(sysfs_val); // <--- Changed from sync_ui(level)
                         }
                     }
                 }
