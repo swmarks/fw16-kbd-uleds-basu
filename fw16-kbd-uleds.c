@@ -706,7 +706,9 @@ int main(int argc, char **argv) {
                 ctxs[i].name, pct, level, ctxs[i].master.vid, ctxs[i].master.pid);
             
             // Immediately sync sysfs and other modules if needed
-            update_sysfs_brightness(ctxs[i].name, (level * max_brightness) / 3);
+            unsigned sysfs_val = (level * max_brightness) / 3;
+            update_sysfs_brightness(ctxs[i].name, sysfs_val);
+
             if (ctxs[i].targets_len > 1) {
                 qmk_apply_all(ctxs[i].targets, ctxs[i].targets_len, level, NULL);
             }
