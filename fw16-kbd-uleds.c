@@ -27,7 +27,7 @@
 //
 // Requires:
 //   - kernel module: uleds
-//   - libsystemd (for D-Bus synchronization)
+//   - libsystemd / basu (for D-Bus synchronization)
 
 #define _GNU_SOURCE
 
@@ -53,7 +53,6 @@
 #include <basu/sd-bus.h>
 #include <time.h>
 #include <unistd.h>
-
 
 // QMK/VIA HID protocol constants (gleaned from Framework's qmk_hid)
 #define QMK_CMD_SET_VALUE 0x07
@@ -143,7 +142,6 @@ static int target_in_list(const target_t *list, size_t len, const target_t *t) {
     return 0;
 }
 
-
 /* -------------------- qmk HIDRAW -------------------- */
 
 static int qmk_hidraw_xfer(const char *hidraw, unsigned char cmd, unsigned char channel, unsigned char addr, unsigned char val, unsigned char *resp) {
@@ -212,7 +210,6 @@ static int qmk_get(const target_t *t) {
     return -1;
 }
 
-
 static void update_sysfs_brightness(const char *name, unsigned val) {
     char path[256];
     snprintf(path, sizeof(path), "/sys/class/leds/%s/brightness", name);
@@ -240,49 +237,17 @@ static void update_sysfs_brightness(const char *name, unsigned val) {
     }
 }
 
-static void sync_ui(unsigned val) {
-    // Synchronize UI via UPower (system bus) and KDE PowerDevil (session bus).
-    dbg(1, "syncing UI to absolute value %u (sd-bus)\n", val);
+static void sync_ui(unsigned val, unsigned pct) {
+    // Synchronize UI via PowerDevil on the true Session Bus
+    dbg(1, "syncing UI to absolute value %u, percentage %u%% (via PowerDevil)\n", val, pct);
 
-    // 1. System Bus (UPower)
-    if (fork() == 0) {
-        sd_bus *bus = NULL;
-        int r = sd_bus_open_system(&bus);
-        if (r >= 0) {
-            sd_bus_message *m = NULL;
-            r = sd_bus_call_method(bus, "org.freedesktop.UPower", "/org/freedesktop/UPower",
-                                   "org.freedesktop.UPower", "EnumerateKbdBacklights", NULL, &m, "");
-            if (r >= 0) {
-                char **paths;
-                if (sd_bus_message_read_strv(m, &paths) >= 0 && paths) {
-                    for (char **p = paths; *p; p++) {
-                        if (g_debug_level >= 3) dbg(3, "  UPower sync: %s\n", *p);
-                        sd_bus_call_method(bus, "org.freedesktop.UPower", *p,
-                                           "org.freedesktop.UPower.KbdBacklight", "SetBrightness", NULL, NULL, "i", (int32_t)val);
-                    }
-                }
-                sd_bus_message_unref(m);
-            }
-            sd_bus_unref(bus);
-        }
-        exit(0);
-    }
-
-    // 2. Session Buses (PowerDevil)
     DIR *d = opendir("/run/user");
     if (d) {
         struct dirent *de;
-        int found_users = 0;
         while ((de = readdir(d))) {
             if (de->d_name[0] == '.') continue;
             uid_t uid = (uid_t)atoi(de->d_name);
             if (uid == 0) continue;
-            found_users++;
-
-            char socket_path[512];
-            snprintf(socket_path, sizeof(socket_path), "/run/user/%u/bus", uid);
-            struct stat st;
-            if (stat(socket_path, &st) != 0 || !S_ISSOCK(st.st_mode)) continue;
 
             if (fork() == 0) {
                 struct passwd *pw = getpwuid(uid);
@@ -290,42 +255,91 @@ static void sync_ui(unsigned val) {
                     setenv("HOME", pw->pw_dir, 1);
                     setenv("USER", pw->pw_name, 1);
 
-                    // FIX: sd-bus / basu requires XDG_RUNTIME_DIR to connect to the session bus!
-                    char run_dir[256];
-                    snprintf(run_dir, sizeof(run_dir), "/run/user/%u", uid);
-                    setenv("XDG_RUNTIME_DIR", run_dir, 1);
+                    // The Catch-All Scraper: Find the TRUE Artix D-Bus Address
+                    DIR *pdir = opendir("/proc");
+                    if (pdir) {
+                        struct dirent *pent;
+                        while ((pent = readdir(pdir))) {
+                            if (pent->d_name[0] < '0' || pent->d_name[0] > '9') continue;
 
-                    char address[528];
-                    snprintf(address, sizeof(address), "unix:path=%s", socket_path);
-                    setenv("DBUS_SESSION_BUS_ADDRESS", address, 1);
+                            char ppath[512];
+                            snprintf(ppath, sizeof(ppath), "/proc/%s/status", pent->d_name);
+                            FILE *f = fopen(ppath, "r");
+                            if (!f) continue;
+
+                            char line[256];
+                            int is_uid = 0;
+                            while (fgets(line, sizeof(line), f)) {
+                                if (strncmp(line, "Uid:", 4) == 0) {
+                                    uid_t f_uid;
+                                    if (sscanf(line + 4, "%u", &f_uid) == 1 && f_uid == uid) is_uid = 1;
+                                    break;
+                                }
+                            }
+                            fclose(f);
+
+                            if (is_uid) {
+                                snprintf(ppath, sizeof(ppath), "/proc/%s/environ", pent->d_name);
+                                f = fopen(ppath, "r");
+                                if (f) {
+                                    char *env_line = NULL;
+                                    size_t env_len = 0;
+                                    int has_display = 0;
+                                    char *bus_addr = NULL;
+
+                                    while (getdelim(&env_line, &env_len, '\0', f) != -1) {
+                                        if (strncmp(env_line, "DISPLAY=", 8) == 0 || strncmp(env_line, "WAYLAND_DISPLAY=", 16) == 0) {
+                                            has_display = 1;
+                                        } else if (strncmp(env_line, "DBUS_SESSION_BUS_ADDRESS=", 25) == 0) {
+                                            bus_addr = strdup(env_line + 25);
+                                        }
+                                    }
+
+                                    // If graphical app on a non-default bus, grab the address!
+                                    if (has_display && bus_addr && strstr(bus_addr, "/run/user/") == NULL) {
+                                        setenv("DBUS_SESSION_BUS_ADDRESS", bus_addr, 1);
+                                        if (g_debug_level >= 3)
+                                            dbg(3, "    Found true dbus address from PID %s: %s\n", pent->d_name, bus_addr);
+                                        free(bus_addr);
+                                        free(env_line);
+                                        fclose(f);
+                                        break;
+                                    }
+                                    if (bus_addr) free(bus_addr);
+                                    free(env_line);
+                                    fclose(f);
+                                }
+                            }
+                        }
+                        closedir(pdir);
+                    }
 
                     sd_bus *sbus = NULL;
-                    int r = sd_bus_open_user(&sbus);
-                    if (r >= 0) {
-                        if (g_debug_level >= 3) dbg(3, "  PowerDevil sync for user %u (%s)\n", uid, pw->pw_name);
+                    if (sd_bus_open_user(&sbus) >= 0) {
                         sd_bus_error error = SD_BUS_ERROR_NULL;
-                        r = sd_bus_call_method(sbus, "org.kde.org_kde_powerdevil",
-                                               "/org/kde/Solid/PowerManagement/Actions/KeyboardBrightnessControl",
-                                               "org.kde.Solid.PowerManagement.Actions.KeyboardBrightnessControl",
-                                               "setKeyboardBrightness", &error, NULL, "i", (int32_t)val);
-                        if (r < 0 && g_debug_level >= 3)
-                            dbg(3, "    PowerDevil call failed for user %u: %s\n", uid, error.message);
+
+                        // Tell PowerDevil directly so it updates the slider AND the OSD natively
+                        // PASSING PCT (PERCENTAGE) INSTEAD OF VAL
+                        int r = sd_bus_call_method(sbus, "org.kde.Solid.PowerManagement",
+                                                   "/org/kde/Solid/PowerManagement/Actions/KeyboardBrightnessControl",
+                                                   "org.kde.Solid.PowerManagement.Actions.KeyboardBrightnessControl",
+                                                   "setKeyboardBrightness", &error, NULL, "i", (int32_t)pct);
+
+                        if (r < 0 && g_debug_level >= 3) {
+                            dbg(3, "    PowerDevil call failed: %s\n", error.message);
+                        } else if (r >= 0 && g_debug_level >= 3) {
+                            dbg(3, "    PowerDevil perfectly synced with %u%%!\n", pct);
+                        }
+
                         sd_bus_error_free(&error);
                         sd_bus_flush(sbus);
                         sd_bus_unref(sbus);
-                    } else if (g_debug_level >= 3) {
-                        dbg(3, "    sd_bus_open_user failed for user %u: %s\n", uid, strerror(-r));
                     }
                 }
                 exit(0);
             }
         }
-        if (found_users == 0 && g_debug_level >= 3) {
-            dbg(3, "  PowerDevil sync: no users found in /run/user\n");
-        }
         closedir(d);
-    } else if (g_debug_level >= 3) {
-        dbg(3, "  PowerDevil sync: failed to opendir /run/user: %s\n", strerror(errno));
     }
 }
 
@@ -607,7 +621,7 @@ int main(int argc, char **argv) {
         target_t disc[16];
         size_t disc_len = 0;
         autodetect_targets(vids, num_vids, disc, &disc_len, 16);
-        
+
         if (disc_len == 0) {
             printf("No devices auto-discovered.\n");
         } else {
@@ -618,7 +632,7 @@ int main(int argc, char **argv) {
             for (size_t i = 0; i < disc_len; i++) {
                 int type = get_type(disc[i].pid);
                 printf("  [%zu] %04x:%04x (%s)\n", i + 1, disc[i].vid, disc[i].pid, type_names[type]);
-                
+
                 int n = snprintf(cli_arg + cli_pos, sizeof(cli_arg) - cli_pos, "%s%04x:%04x", (i == 0 ? "" : ","), disc[i].vid, disc[i].pid);
                 if (n > 0) cli_pos += (size_t)n;
             }
@@ -702,18 +716,18 @@ int main(int argc, char **argv) {
             }
             unsigned level = (pct >= 0) ? pct_to_level((unsigned)pct) : 0;
             ctxs[i].last_level = level;
-            dbg(1, "initial state [%s]: %d%% (level %u) master=%04x:%04x\n", 
+            dbg(1, "initial state [%s]: %d%% (level %u) master=%04x:%04x\n",
                 ctxs[i].name, pct, level, ctxs[i].master.vid, ctxs[i].master.pid);
-            
+
             // Immediately sync sysfs and other modules if needed
             unsigned sysfs_val = (level * max_brightness) / 3;
+            unsigned pct_val = (level * 100) / 3;
             update_sysfs_brightness(ctxs[i].name, sysfs_val);
-
             if (ctxs[i].targets_len > 1) {
                 qmk_apply_all(ctxs[i].targets, ctxs[i].targets_len, level, NULL);
             }
-            // Sync UPower state to match initial hardware level
-            sync_ui(sysfs_val);
+            // Sync UI state natively
+            sync_ui(sysfs_val, pct_val);
         }
     }
 
@@ -785,8 +799,9 @@ int main(int argc, char **argv) {
                             qmk_apply_all(ctxs[i].targets, ctxs[i].targets_len, level, &ctxs[i].master);
 
                             unsigned sysfs_val = (level * max_brightness) / 3;
+                            unsigned pct_val = (level * 100) / 3;
                             update_sysfs_brightness(ctxs[i].name, sysfs_val);
-                            sync_ui(sysfs_val); // <--- Changed from sync_ui(level)
+                            sync_ui(sysfs_val, pct_val);
                         }
                     }
                 }
@@ -804,7 +819,7 @@ int main(int argc, char **argv) {
                     if (r > 0) {
                         unsigned raw = decode_uleds(buf, r);
                         unsigned level = pct_to_level((raw * 100) / max_brightness);
-                        dbg(2, "event [%s]: raw=%u max=%u level=%u last=%u\n", 
+                        dbg(2, "event [%s]: raw=%u max=%u level=%u last=%u\n",
                             ctxs[i].name, raw, max_brightness, level, ctxs[i].last_level);
                         if (level != ctxs[i].last_level) {
                             qmk_apply_all(ctxs[i].targets, ctxs[i].targets_len, level, NULL);
