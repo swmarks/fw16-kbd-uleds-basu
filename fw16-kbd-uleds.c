@@ -50,7 +50,7 @@
 #include <sys/wait.h>
 #include <sys/ioctl.h>
 #include <linux/hidraw.h>
-#include <systemd/sd-bus.h>
+#include <basu/sd-bus.h>
 #include <time.h>
 #include <unistd.h>
 
